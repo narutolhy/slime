@@ -20,6 +20,91 @@ from slime.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
+def apply_min_p(
+    logits: torch.Tensor,
+    min_p: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Filters logits using adaptive probability thresholding.
+    """
+    # Convert logits to probability distribution
+    probability_values = torch.nn.functional.softmax(logits, dim=-1)
+    # Calculate maximum probabilities per sequence
+    max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
+    # Reshape min_p for broadcasting
+    adjusted_min_p = min_p.unsqueeze(1) * max_probabilities
+    # Identify valid tokens using threshold comparison
+    valid_token_mask = probability_values >= adjusted_min_p
+    # Apply mask using boolean indexing (xla friendly)
+    logits.masked_fill_(~valid_token_mask, -float("inf"))
+    return logits
+
+def apply_top_k_only(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply top-k mask to the logits.
+
+    This implementation doesn't involve sorting the entire vocab.
+
+    The logits tensor may be updated in-place.
+    """
+    no_top_k_mask = k == logits.shape[1]
+    # Set non-top-k rows to 1 so that we can gather.
+    k = k.masked_fill(no_top_k_mask, 1)
+    max_top_k = k.max()
+    # topk.values tensor has shape [batch_size, max_top_k].
+    # Convert top k to 0-based index in range [0, max_top_k).
+    k_index = k.sub_(1).unsqueeze(1)
+    top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
+    # Handle non-topk rows.
+    top_k_mask.masked_fill_(no_top_k_mask.unsqueeze(1), -float("inf"))
+    logits.masked_fill_(logits < top_k_mask, -float("inf"))
+    return logits
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply top-k and top-p masks to the logits.
+
+    If a top-p is used, this function will sort the logits tensor,
+    which can be slow for large batches.
+
+    The logits tensor may be updated in-place.
+    """
+    if p is None:
+        if k is None:
+            return logits
+
+        # Avoid sorting vocab for top-k only case.
+        return apply_top_k_only(logits, k)
+
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+
+    if k is not None:
+        # Apply top-k.
+        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
+        # Get all the top_k values.
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+        top_k_mask = logits_sort < top_k_mask
+        logits_sort.masked_fill_(top_k_mask, -float("inf"))
+
+    if p is not None:
+        # Apply top-p.
+        probs_sort = logits_sort.softmax(dim=-1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        # at least one
+        top_p_mask[:, -1] = False
+        logits_sort.masked_fill_(top_p_mask, -float("inf"))
+
+    # Re-sort the probabilities.
+    logits = torch.empty_like(logits)
+    logits.scatter_(dim=1, index=logits_idx, src=logits_sort)
+    return logits
 
 def get_responses(
     logits: torch.Tensor,
@@ -55,6 +140,25 @@ def get_responses(
 
     logits = logits.squeeze(0)
     logits = logits.div(args.rollout_temperature)
+
+    if args.rollout_top_k is not None or args.rollout_top_p is not None:
+        k = None
+        p = None
+        if args.rollout_top_k is not None and args.rollout_top_k > 0:
+            k = torch.full(
+                (logits.size(0),), int(args.rollout_top_k),
+                device=logits.device, dtype=torch.long
+            )
+        if args.rollout_top_p is not None and args.rollout_top_p < 1.0:
+            p = torch.full(
+                (logits.size(0),), float(args.rollout_top_p),
+                device=logits.device, dtype=logits.dtype
+            )
+        logits = apply_top_k_top_p(logits, k, p)
+
+    if args.rollout_min_p is not None and args.rollout_min_p > 0.0:
+        min_p = torch.full((logits.size(0),), args.rollout_min_p, device=logits.device, dtype=logits.dtype)
+        logits = apply_min_p(logits, min_p)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -427,9 +531,8 @@ def policy_loss_function(
             pg_loss: torch.Tensor,
             train_log_probs: list[torch.Tensor],
             rollout_log_probs: list[torch.Tensor],
-            loss_masks: list[torch.Tensor],
             **kwargs: Any,
-        ) -> Tuple[torch.Tensor, list[torch.Tensor], Dict[str, torch.Tensor]]:
+        ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
             rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
             old_log_probs = torch.cat(train_log_probs, dim=0)
             tis = torch.exp(old_log_probs - rollout_log_probs)
@@ -442,7 +545,7 @@ def policy_loss_function(
                 "tis_abs": tis_abs.clone().detach(),
             }
             pg_loss = pg_loss * tis_weights
-            return pg_loss, loss_masks, metrics
+            return pg_loss, metrics
 
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
@@ -461,13 +564,7 @@ def policy_loss_function(
             tis_func = load_function(args.custom_tis_function_path)
         else:
             tis_func = vanilla_tis_function
-        pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
-
-        # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-        # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
-        sum_of_sample_mean = get_sum_of_sample_mean(
-            total_lengths, response_lengths, modified_response_masks, args.calculate_per_token_loss
-        )
+        pg_loss, tis_metrics = tis_func(**tis_kwargs)
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -496,11 +593,6 @@ def policy_loss_function(
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
-    train_rollout_logprob_abs_diff = None
-    if "rollout_log_probs" in batch:
-        rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
-
     reported_loss = {
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
@@ -508,9 +600,6 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
-
-    if train_rollout_logprob_abs_diff is not None:
-        reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()

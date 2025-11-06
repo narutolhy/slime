@@ -1293,3 +1293,38 @@ index 4c94cbac9..415ab09c5 100644
  
  @torch.compile(dynamic=True)
  def get_last_loc_large_page_size_top_k_1(
+
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index 584e6c8c9..b02df0887 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -131,6 +131,13 @@ class Sampler(nn.Module):
+                         batch_next_token_ids = min_p_sampling_from_probs(
+                             probs, sampling_info.min_ps
+                         )
++                        max_p = probs.amax(dim=-1, keepdim=True)
++                        thr = sampling_info.min_ps.unsqueeze(1) * max_p
++                        keep = probs >= thr
++                        argmax_idx = probs.argmax(dim=-1, keepdim=True)
++                        keep.scatter_(1, argmax_idx, True)
++                        masked = probs * keep
++                        probs = masked / masked.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+                     else:
+                         batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                             probs.contiguous(),
+@@ -278,6 +285,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
+     if need_min_p_sampling:
+         min_p_thresholds = probs_sort[:, 0] * min_ps
+         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+                              else:
+                         batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                             probs.contiguous(),
+@@ -278,6 +285,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
+     if need_min_p_sampling:
+         min_p_thresholds = probs_sort[:, 0] * min_ps
+         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
++        probs_sort = torch.nn.functional.normalize(probs_sort, p=1, dim=-1)
++        probs.zero_().scatter_(1, probs_idx.long(), probs_sort)
+     if sampling_seed is not None:
+         sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
+     else:

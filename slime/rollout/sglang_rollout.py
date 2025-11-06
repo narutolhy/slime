@@ -51,6 +51,7 @@ class GenerateState(metaclass=SingletonMeta):
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
             top_k=args.rollout_top_k,
+            min_p=args.rollout_min_p,
             max_new_tokens=args.rollout_max_response_len,
             stop=args.rollout_stop,
             stop_token_ids=args.rollout_stop_token_ids,
